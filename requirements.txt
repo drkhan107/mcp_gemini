@@ -1,0 +1,8 @@
+numpy
+faiss-cpu
+python-dotenv
+httpx
+google-ai-generativelanguage
+google-generativeai
+mcp
+loguru

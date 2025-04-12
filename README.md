@@ -32,13 +32,39 @@ python sse_server.py
 ```
 ✅ This will start the MCP server at the configured port (default is http://localhost:8080/sse).
 
-### 5. 🧠 Start the MCP Client
+### 5. 🧠 Start the MCP Client (Optional)
 Once the server is running, start the SSE client with the server URL:
 
 ```bash
 
 python ssc_client.py http://localhost:8080/sse
 ```
+
+### 6. 🧠 Start the FastAPI server (To Use GUI)
+Run the following command (To change the port etc, edit the fastapp.py file)
+
+```bash
+
+python fastapp.py
+```
+
+### 7. Launch Streamlit app
+- Make sure MCP server is running (http://localhost:8080/sse)
+- Make sure FastAPI is running.
+
+Run the following command
+
+```bash
+
+streamlit run app.py 
+```
+
+This will start the streamlit app on port 8501
+
+### 8. Browser
+One you open the browser (localhost:8501), click on connect to MCP server.
+
+![alt text](image.png)
 
 ✅ Done!
 You now have a working demo of the Model Context Protocol with Gemini.

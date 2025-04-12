@@ -25,6 +25,7 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.anthropic = None
+        self.connected = False
 
         generation_config = {
                 "temperature": 0.9,
@@ -72,55 +73,98 @@ class MCPClient:
     async def connect_to_sse_server(self, server_url: str):
         """Connect to an MCP server running with SSE transport"""
         # Store the context managers so they stay alive
-        self._streams_context = sse_client(url=server_url)
-        streams = await self._streams_context.__aenter__()
+        try:
+            self._streams_context = sse_client(url=server_url)
+            streams = await self._streams_context.__aenter__()
 
-        self._session_context = ClientSession(*streams)
-        self.session: ClientSession = await self._session_context.__aenter__()
+            self._session_context = ClientSession(*streams)
+            self.session: ClientSession = await self._session_context.__aenter__()
 
-        # Initialize
-        await self.session.initialize()
+            # Initialize
+            await self.session.initialize()
 
-        # List available tools to verify connection
-        print("Initialized SSE client...")
-        print("Listing tools...")
-        response = await self.session.list_tools()
-        tools = response.tools
-        self.mcp_tools=tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+            # List available tools to verify connection
+            print("Initialized SSE client...")
+            print("Listing tools...")
+            response = await self.session.list_tools()
+            tools = response.tools
+            self.mcp_tools=tools
+            print("\nConnected to server with tools:", [tool.name for tool in tools])
 
 
-        ######## For Gemini
-        # Convert MCP tools to Gemini tool format
-        self.gemini_tools = []
-        declarations = []
-        for mcp_tool in tools:
-            if isinstance(mcp_tool.inputSchema, dict): # Ensure it's a dict
-                param_schema = self._mcp_schema_to_gemini_schema(mcp_tool.inputSchema)
-                declarations.append(glm.FunctionDeclaration(
-                    name=mcp_tool.name,
-                    description=mcp_tool.description or '',
-                    parameters=param_schema
-                ))
-            else:
-                    logging.warning(f"Skipping tool {mcp_tool.name} due to non-dict inputSchema: {type(mcp_tool.inputSchema)}")
+            ######## For Gemini
+            # Convert MCP tools to Gemini tool format
+            self.gemini_tools = []
+            declarations = []
+            for mcp_tool in tools:
+                if isinstance(mcp_tool.inputSchema, dict): # Ensure it's a dict
+                    param_schema = self._mcp_schema_to_gemini_schema(mcp_tool.inputSchema)
+                    declarations.append(glm.FunctionDeclaration(
+                        name=mcp_tool.name,
+                        description=mcp_tool.description or '',
+                        parameters=param_schema
+                    ))
+                else:
+                        logging.warning(f"Skipping tool {mcp_tool.name} due to non-dict inputSchema: {type(mcp_tool.inputSchema)}")
 
-        if declarations:
-            self.gemini_tools=declarations#glm.Tool(function_declarations=declarations)
-        #print("G tools", self.gemini_tools[0])
-        tool_names = [t.name for t in tools]
-        logging.info(f"Connected to server. Available tools: {tool_names}")
-        if not tool_names:
-                logging.warning("No tools found on the server.")
-
+            if declarations:
+                self.gemini_tools=declarations#glm.Tool(function_declarations=declarations)
+            #print("G tools", self.gemini_tools[0])
+            tool_names = [t.name for t in tools]
+            logging.info(f"Connected to server. Available tools: {tool_names}")
+            self.connected = True
+            if not tool_names:
+                    logging.warning("No tools found on the server.")
+        except Exception as e:
+            logging.error(f"Failed during connection or tool processing: {e}", exc_info=True) # Log full traceback
+            await self.cleanup() # Attempt cleanup on *any* error during connection/processing
+            self.connected = False
+            raise # Re-raise the exception so the Streamlit UI can catch and display it
         ##########
 
+    
+    
     async def cleanup(self):
-        """Properly clean up the session and streams"""
-        if self._session_context:
-            await self._session_context.__aexit__(None, None, None)
-        if self._streams_context:
-            await self._streams_context.__aexit__(None, None, None)
+        """Properly clean up the session and streams, handling potential errors including task mismatches."""
+        logging.info("Attempting to clean up MCP client resources...")
+        if self.exit_stack:
+            try:
+                await self.exit_stack.aclose()
+                logging.info("AsyncExitStack successfully closed contexts.")
+            except RuntimeError as re:
+                # Specifically catch the RuntimeError related to cancel scopes
+                if "Attempted to exit cancel scope" in str(re):
+                    logging.warning(f"Known issue: Caught RuntimeError during cleanup, likely due to task mismatch: {re}")
+                    logging.warning("This often occurs with libraries using cancel scopes (like anyio/httpx) when cleanup happens in a different task/event loop than setup in Streamlit's asyncio.run model.")
+                    # Continue with cleanup despite this specific error
+                else:
+                    # Re-raise other RuntimeErrors
+                    logging.error(f"Caught unexpected RuntimeError during cleanup: {re}", exc_info=True)
+                    # Optionally re-raise here if other RuntimeErrors should halt things
+            except Exception as e:
+                # Catch other potential exceptions during cleanup
+                logging.error(f"Caught general Exception during AsyncExitStack cleanup: {e}", exc_info=True)
+            finally:
+                # --- CRITICAL: Reset state and recreate stack ---
+                self.session = None
+                self._streams_context = None
+                self._session_context = None
+                self.connected = False
+                self.mcp_tools = []
+                self.gemini_tools = []
+                # Recreate the exit_stack for potential future connections
+                self.exit_stack = AsyncExitStack()
+                logging.info("Client state reset after cleanup attempt.")
+        else:
+            # ... (rest of the existing else block for missing exit_stack) ...
+            logging.warning("Cleanup called but exit_stack was None or already closed.")
+            self.session = None
+            self._streams_context = None
+            self._session_context = None
+            self.connected = False
+            self.mcp_tools = []
+            self.gemini_tools = []
+            self.exit_stack = AsyncExitStack() # Ensure it's recreated here too
 
     async def process_query(self, query: str) -> str:
         """Process a query using Claude and available tools"""
@@ -226,81 +270,97 @@ class MCPClient:
             logging.debug(f"Initial Gemini response received: {response.candidates[0].content if response.candidates else 'No candidates'}")
             #print(f"*** -- ***Initial Gemini response received: {response.candidates[0].content if response.candidates else 'No candidates'}")
 
+            full_text_response = ""
+            found_function_calls = [] # Store potentially multiple calls (though usually one per turn)
 
-            # Check for function call request
-            response_text = response.candidates[0].content.parts[0]
-            
-            print("** Part",response_text)
-            parts=len(response.candidates[0].content.parts)
-            print("Parts Length: ",parts)
-            if parts >1 :
-                response_part=response.candidates[0].content.parts[1] 
-                fc = response_part.function_call
-                tool_name = fc.name
-                tool_args_struct = fc.args # This is a google.protobuf.struct_pb2.Struct
-                print("** Tool Call",tool_name)
-                 # Convert Struct to Python dict
-                tool_args = {}
-                for key, value in tool_args_struct.items():
-                    # Basic conversion, might need refinement for complex types
-                    if hasattr(value, 'string_value'):
-                        tool_args[key] = value.string_value
-                    elif hasattr(value, 'number_value'):
-                        tool_args[key] = value.number_value
-                    elif hasattr(value, 'bool_value'):
-                         tool_args[key] = value.bool_value
-                    # Add more type handling if needed (list, struct, null)
+            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                #part = response.candidates[0].content.parts[0] # Often just the first part
+                
+                for part in response.candidates[0].content.parts:
+                    if part.text:
+                        print(f"Found Text Part: '{part.text}'")
+                        full_text_response += part.text  # Append text parts together
+                    elif part.function_call:
+                        print(f"Found Function Call Part: {part.function_call.name}")
+                        found_function_calls.append(part.function_call)
                     else:
-                         tool_args[key] = str(value) # Fallback
+                        print("Found an empty or unexpected part.")
 
-                logging.info(f"Gemini requested tool call: {tool_name}({tool_args})")
+                
+                    
+                print(f"Received Text: {full_text_response}")
 
-                # Find the corresponding MCP tool (optional, for validation)
-                mcp_tool = next((t for t in self.gemini_tools if t.name == tool_name), None)
-                if not mcp_tool:
-                    logging.error(f"Gemini requested unknown tool: {tool_name}")
-                    # Send error back to Gemini
-                    func_response = glm.FunctionResponse(name=tool_name, response={"error": f"Tool '{tool_name}' not found."})
-                    response = await self.chat.send_message_async(
-                         glm.Part(function_response=func_response), tools=self.gemini_tools
-                    )
-
-                else:
-                    # Call the MCP server tool
-                    try:
-                        logging.info(f"Calling MCP tool '{tool_name}'...")
-                        mcp_result = await self.session.call_tool(tool_name, tool_args)
-                        logging.info(f"MCP tool '{tool_name}' executed.")
-
-                        # Check if MCP result indicates an error (basic check)
-                        mcp_content_str = " ".join(c.text for c in mcp_result.content if hasattr(c, 'text'))
-                        if mcp_result.isError or "error occurred" in mcp_content_str.lower():
-                             logging.warning(f"MCP tool '{tool_name}' returned an error: {mcp_content_str}")
-                             tool_response_content = {"error": mcp_content_str}
+                if found_function_calls:
+            # Check for function call request
+                    print("** Functions calls",found_function_calls)
+                    
+                    #response_part=response.candidates[0].content.parts[1] 
+                    fc = found_function_calls[0]
+                    tool_name = fc.name
+                    tool_args_struct = fc.args # This is a google.protobuf.struct_pb2.Struct
+                    print("** Tool Call",tool_name)
+                    # Convert Struct to Python dict
+                    tool_args = {}
+                    for key, value in tool_args_struct.items():
+                        # Basic conversion, might need refinement for complex types
+                        if hasattr(value, 'string_value'):
+                            tool_args[key] = value.string_value
+                        elif hasattr(value, 'number_value'):
+                            tool_args[key] = value.number_value
+                        elif hasattr(value, 'bool_value'):
+                            tool_args[key] = value.bool_value
+                        # Add more type handling if needed (list, struct, null)
                         else:
-                             tool_response_content = {"result": mcp_content_str}
+                            tool_args[key] = str(value) # Fallback
 
+                    logging.info(f"Gemini requested tool call: {tool_name}({tool_args})")
 
-                        # Format result for Gemini
-                        func_response = glm.FunctionResponse(
-                            name=tool_name,
-                            response=tool_response_content
-                        )
-
-                        # Send tool result back to Gemini
-                        logging.info(f"Sending tool result for '{tool_name}' back to Gemini.")
-                        response = await self.chat.send_message_async(
-                             glm.Part(function_response=func_response), tools=self.gemini_tools
-                        )
-                        logging.debug("Received final Gemini response after tool call.")
-
-                    except Exception as e:
-                        logging.exception(f"Error calling MCP tool '{tool_name}'")
+                    # Find the corresponding MCP tool (optional, for validation)
+                    mcp_tool = next((t for t in self.gemini_tools if t.name == tool_name), None)
+                    if not mcp_tool:
+                        logging.error(f"Gemini requested unknown tool: {tool_name}")
                         # Send error back to Gemini
-                        func_response = glm.FunctionResponse(name=tool_name, response={"error": f"Failed to execute tool: {e}"})
+                        func_response = glm.FunctionResponse(name=tool_name, response={"error": f"Tool '{tool_name}' not found."})
                         response = await self.chat.send_message_async(
-                             glm.Part(function_response=func_response), tools=self.gemini_tools
+                            glm.Part(function_response=func_response), tools=self.gemini_tools
                         )
+
+                    else:
+                        # Call the MCP server tool
+                        try:
+                            logging.info(f"Calling MCP tool '{tool_name}'...")
+                            mcp_result = await self.session.call_tool(tool_name, tool_args)
+                            logging.info(f"MCP tool '{tool_name}' executed.")
+
+                            # Check if MCP result indicates an error (basic check)
+                            mcp_content_str = " ".join(c.text for c in mcp_result.content if hasattr(c, 'text'))
+                            if mcp_result.isError or "error occurred" in mcp_content_str.lower():
+                                logging.warning(f"MCP tool '{tool_name}' returned an error: {mcp_content_str}")
+                                tool_response_content = {"error": mcp_content_str}
+                            else:
+                                tool_response_content = {"result": mcp_content_str}
+
+
+                            # Format result for Gemini
+                            func_response = glm.FunctionResponse(
+                                name=tool_name,
+                                response=tool_response_content
+                            )
+
+                            # Send tool result back to Gemini
+                            logging.info(f"Sending tool result for '{tool_name}' back to Gemini.")
+                            response = await self.chat.send_message_async(
+                                glm.Part(function_response=func_response), tools=self.gemini_tools
+                            )
+                            logging.debug("Received final Gemini response after tool call.")
+
+                        except Exception as e:
+                            logging.exception(f"Error calling MCP tool '{tool_name}'")
+                            # Send error back to Gemini
+                            func_response = glm.FunctionResponse(name=tool_name, response={"error": f"Failed to execute tool: {e}"})
+                            response = await self.chat.send_message_async(
+                                glm.Part(function_response=func_response), tools=self.gemini_tools
+                            )
 
             # --- Extract final text response ---
             final_text = ""
@@ -343,6 +403,7 @@ class MCPClient:
                     
             except Exception as e:
                 print(f"\nError: {str(e)}")
+            
 
 
 async def main():

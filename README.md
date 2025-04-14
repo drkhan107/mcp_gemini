@@ -62,7 +62,7 @@ streamlit run app.py
 This will start the streamlit app on port 8501
 
 ### 8. Browser
-One you open the browser (localhost:8501), click on connect to MCP server.
+Once you open the browser (localhost:8501), click on connect to MCP server.
 
 ![alt text](image.png)
 
